@@ -2,6 +2,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
+import { apiUrl } from "../lib/api";
+
 type Candle = { Date: string; Close: number };
 
 type IndicatorsResp = {
@@ -11,23 +13,21 @@ type IndicatorsResp = {
   bb_lower: number;
 };
 
-const API = process.env.NEXT_PUBLIC_API_URL || "/api";
-
 async function getHistory(ticker: string): Promise<Candle[]> {
   const start = new Date(Date.now() - 220 * 86400000)
     .toISOString()
     .slice(0, 10);
   const end = new Date().toISOString().slice(0, 10);
-  const url = `${API}/history?ticker=${encodeURIComponent(
-    ticker
-  )}&start=${start}&end=${end}`;
+  const params = new URLSearchParams({ ticker, start, end });
+  const url = `${apiUrl("/history")}?${params.toString()}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`History error ${res.status}`);
   return res.json();
 }
 
 async function getIndicators(ticker: string): Promise<IndicatorsResp> {
-  const res = await fetch(`${API}/indicators?ticker=${encodeURIComponent(ticker)}`);
+  const params = new URLSearchParams({ ticker });
+  const res = await fetch(`${apiUrl("/indicators")}?${params.toString()}`);
   if (!res.ok) throw new Error(`Indicators error ${res.status}`);
   return res.json();
 }

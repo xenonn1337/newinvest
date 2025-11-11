@@ -1,12 +1,9 @@
 "use client";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-declare global {
-  interface Window {
-    TradingView: any;
-  }
-}
+import { apiUrl } from "../lib/api";
+import { useTradingView } from "../hooks/useTradingView";
 
 type Candle = {
   Date: string;
@@ -19,16 +16,13 @@ type PredictResponse = {
   rmse: number;
 };
 
-const API = process.env.NEXT_PUBLIC_API_URL || "/api";
-
 async function getHistoryRange(
   ticker: string,
   start: string,
   end: string
 ): Promise<Candle[]> {
-  const url = `${API}/history?ticker=${encodeURIComponent(
-    ticker
-  )}&start=${start}&end=${end}`;
+  const params = new URLSearchParams({ ticker, start, end });
+  const url = `${apiUrl("/history")}?${params.toString()}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`History error ${res.status}`);
   return res.json();
@@ -39,9 +33,8 @@ async function getPredictionAsOf(
   days: number,
   asof: string
 ): Promise<PredictResponse> {
-  const url = `${API}/predict?ticker=${encodeURIComponent(
-    ticker
-  )}&days=${days}&asof=${asof}`;
+  const params = new URLSearchParams({ ticker, days: String(days), asof });
+  const url = `${apiUrl("/predict")}?${params.toString()}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Predict error ${res.status}`);
   return res.json();
@@ -74,36 +67,28 @@ export default function BacktestPanel({
   const predSeriesRef = useRef<any>(null);
   const realSeriesRef = useRef<any>(null);
   const [stats, setStats] = useState<{ sharpePred: number; sharpeBH: number }>();
+  const [loading, setLoading] = useState(false);
+  const tvReady = useTradingView();
 
-  useEffect(() => {
-    if (!window.TradingView) return;
-    if (widgetRef.current) widgetRef.current.remove();
-    widgetRef.current = new window.TradingView.widget({
-      container_id: containerId,
-      symbol: ticker,
-      theme: "dark",
-      interval: "D",
-      hide_top_toolbar: false,
-      autosize: true,
-      locale: "en",
-    });
-    widgetRef.current.onChartReady(() => {
-      predSeriesRef.current = widgetRef.current
-        .chart()
-        .createMultilineSeries({ title: "Predicted (as-of)" });
-      realSeriesRef.current = widgetRef.current
-        .chart()
-        .createMultilineSeries({ title: "Actual" });
-    });
-  }, [ticker]);
-
-  const runBacktest = async () => {
+  const runBacktest = useCallback(async () => {
+    if (!predSeriesRef.current || !realSeriesRef.current) return;
+    const request = { ticker, asof: date, horizon: days };
+    setLoading(true);
     try {
       const today = new Date().toISOString().slice(0, 10);
       const [hist, pred] = await Promise.all([
-        getHistoryRange(ticker, date, today),
-        getPredictionAsOf(ticker, days, date),
+        getHistoryRange(request.ticker, request.asof, today),
+        getPredictionAsOf(request.ticker, request.horizon, request.asof),
       ]);
+
+      if (
+        request.ticker !== ticker ||
+        request.asof !== date ||
+        request.horizon !== days
+      ) {
+        return;
+      }
+
       const actual = hist.map((c) => ({
         time: Math.floor(new Date(c.Date).getTime() / 1000),
         value: c.Close,
@@ -123,7 +108,7 @@ export default function BacktestPanel({
       const retPred: number[] = [];
       for (let i = 1; i < actualCloses.length; i++) {
         retBH.push((actualCloses[i] - actualCloses[i - 1]) / actualCloses[i - 1]);
-        if (i < predCloses.length) {
+        if (i < predCloses.length && predCloses[i - 1] !== 0) {
           retPred.push(
             (predCloses[i] - predCloses[i - 1]) / predCloses[i - 1]
           );
@@ -132,12 +117,52 @@ export default function BacktestPanel({
       setStats({ sharpePred: sharpe(retPred), sharpeBH: sharpe(retBH) });
     } catch (e: any) {
       toast.error(e?.message ?? "Backtest failed");
+    } finally {
+      setLoading(false);
     }
-  };
+  }, [ticker, date, days]);
 
   useEffect(() => {
-    if (widgetRef.current) runBacktest();
-  }, [ticker]);
+    if (!tvReady || typeof window === "undefined") return;
+
+    const widget = new window.TradingView.widget({
+      container_id: containerId,
+      symbol: ticker,
+      theme: "dark",
+      interval: "D",
+      hide_top_toolbar: false,
+      autosize: true,
+      locale: "en",
+    });
+
+    widgetRef.current = widget;
+    predSeriesRef.current = null;
+    realSeriesRef.current = null;
+
+    widget.onChartReady(() => {
+      predSeriesRef.current = widget
+        .chart()
+        .createMultilineSeries({ title: "Predicted (as-of)" });
+      realSeriesRef.current = widget
+        .chart()
+        .createMultilineSeries({ title: "Actual" });
+      runBacktest();
+    });
+
+    return () => {
+      predSeriesRef.current = null;
+      realSeriesRef.current = null;
+      widgetRef.current = null;
+      if (widget.remove) {
+        widget.remove();
+      }
+    };
+  }, [tvReady, ticker, runBacktest]);
+
+  useEffect(() => {
+    if (!predSeriesRef.current || !realSeriesRef.current) return;
+    runBacktest();
+  }, [runBacktest]);
 
   return (
     <div className="glass rounded-3xl p-4">
@@ -170,9 +195,10 @@ export default function BacktestPanel({
           </div>
           <button
             onClick={runBacktest}
-            className="px-3 py-2 rounded-xl glass hover:bg-white/10"
+            className="px-3 py-2 rounded-xl glass hover:bg-white/10 disabled:opacity-60"
+            disabled={loading}
           >
-            Run
+            {loading ? "Running…" : "Run"}
           </button>
         </div>
       </div>

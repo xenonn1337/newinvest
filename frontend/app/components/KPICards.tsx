@@ -4,9 +4,12 @@ import React, { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
+import { apiUrl } from "../lib/api";
+
 interface PredictResponse {
   dates: string[];
-  predictions: number[];
+  prices: number[];
+  rmse: number;
 }
 
 interface KPICardsProps {
@@ -15,8 +18,8 @@ interface KPICardsProps {
 }
 
 async function getPrediction(ticker: string, days: number): Promise<PredictResponse> {
-  const url = `http://localhost:8000/predict?ticker=${ticker}&days=${days}`;
-  const res = await fetch(url);
+  const params = new URLSearchParams({ ticker, days: String(days) });
+  const res = await fetch(`${apiUrl("/predict")}?${params.toString()}`);
 
   if (!res.ok) {
     const text = await res.text();
@@ -27,7 +30,7 @@ async function getPrediction(ticker: string, days: number): Promise<PredictRespo
 }
 
 export default function KPICards({ ticker, days }: KPICardsProps) {
-  const { data, error, isLoading } = useQuery({
+  const { data, error, isLoading } = useQuery<PredictResponse>({
     queryKey: ["prediction", ticker, days],
     queryFn: () => getPrediction(ticker, days),
     enabled: !!ticker && !!days,
@@ -40,29 +43,51 @@ export default function KPICards({ ticker, days }: KPICardsProps) {
     }
   }, [error]);
 
-  if (isLoading) return <div className="text-center py-8">Loading prediction...</div>;
-  if (!data?.predictions?.length) return <div className="text-center py-8">No data available</div>;
+  if (isLoading)
+    return <div className="text-center py-8 text-sm text-slate-300">Loading prediction…</div>;
+  if (!data?.prices?.length)
+    return <div className="text-center py-8 text-sm text-slate-300">No forecast available</div>;
 
-  const finalPrice = data.predictions[data.predictions.length - 1];
-  const change = ((finalPrice - 150) / 150) * 100; // mock current price
+  const startPrice = data.prices[0];
+  const finalPrice = data.prices[data.prices.length - 1];
+  const change = startPrice ? ((finalPrice - startPrice) / startPrice) * 100 : 0;
+  const rmseValue = Number.isFinite(data.rmse) ? data.rmse : null;
+  const confidence =
+    rmseValue && startPrice
+      ? Math.max(0, Math.min(100, 100 - (rmseValue / startPrice) * 100))
+      : null;
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
-      <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-        <h3 className="text-sm font-medium text-slate-400">Final Prediction</h3>
+      <div className="glass border border-slate-700/60 p-6 rounded-xl">
+        <h3 className="text-sm font-medium text-slate-400">Projected Price</h3>
         <p className="text-3xl font-bold text-white mt-2">
           ${finalPrice.toFixed(2)}
         </p>
-      </div>
-      <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-        <h3 className="text-sm font-medium text-slate-400">Change</h3>
-        <p className={`text-3xl font-bold mt-2 ${change > 0 ? "text-green-400" : "text-red-400"}`}>
-          {change > 0 ? "+" : ""}{change.toFixed(1)}%
+        <p className="text-xs text-slate-400 mt-1">
+          {data.dates[data.dates.length - 1]}
         </p>
       </div>
-      <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-        <h3 className="text-sm font-medium text-slate-400">Confidence</h3>
-        <p className="text-3xl font-bold text-white mt-2">87%</p>
+      <div className="glass border border-slate-700/60 p-6 rounded-xl">
+        <h3 className="text-sm font-medium text-slate-400">Projected Change</h3>
+        <p
+          className={`text-3xl font-bold mt-2 ${
+            change > 0 ? "text-green-400" : change < 0 ? "text-red-400" : "text-slate-200"
+          }`}
+        >
+          {change > 0 ? "+" : ""}
+          {change.toFixed(1)}%
+        </p>
+        <p className="text-xs text-slate-400 mt-1">vs. first forecasted close</p>
+      </div>
+      <div className="glass border border-slate-700/60 p-6 rounded-xl">
+        <h3 className="text-sm font-medium text-slate-400">Model Confidence</h3>
+        <p className="text-3xl font-bold text-white mt-2">
+          {confidence !== null ? `${confidence.toFixed(0)}%` : "—"}
+        </p>
+        <p className="text-xs text-slate-400 mt-1">
+          RMSE (90d): {rmseValue !== null ? rmseValue.toFixed(2) : "n/a"}
+        </p>
       </div>
     </div>
   );
