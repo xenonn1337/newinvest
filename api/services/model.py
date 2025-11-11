@@ -1,23 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel
+from sklearn.preprocessing import MinMaxScaler
 
 from core.config import settings
 from services.yahoo import fetch_history
-
-
-@dataclass
-class _SeriesPrediction:
-    """Internal container for predictions and rmse."""
-    dates: list[str]
-    prices: list[float]
-    rmse: float
 
 
 class PredictResponseModel(BaseModel):
@@ -33,35 +25,39 @@ class PredictResponse(PredictResponseModel):
 
 
 def _prepare_sequences(series: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Create sequences for LSTM input."""
-    X, y = [], []
-    for i in range(window, len(series)):
-        X.append(series[i - window : i])
-        y.append(series[i])
-    X_arr = np.array(X).reshape(-1, window, 1)
-    y_arr = np.array(y)
+    """Create sliding windows for LSTM input following JordiCorbilla repo."""
+
+    flattened = series.reshape(-1)
+    if window <= 1 or len(flattened) <= window:
+        raise ValueError("Insufficient samples for requested window")
+
+    X: list[np.ndarray] = []
+    y: list[float] = []
+    for i in range(window, len(flattened)):
+        X.append(flattened[i - window : i])
+        y.append(flattened[i])
+
+    X_arr = np.array(X, dtype=np.float32).reshape(-1, window, 1)
+    y_arr = np.array(y, dtype=np.float32)
     return X_arr, y_arr
 
 
-def _load_lstm() -> object:
-    """
-    Load JordiCorbilla LSTM model code (assumed cloned in ./lstm-repo).
-    Fallback to a simple EMA-based forecaster if import fails.
-    """
-    try:
-        import importlib.util
-        import sys
-        spec = importlib.util.spec_from_file_location(
-            "jordi_lstm", "lstm-repo/lstm_model.py"
-        )
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            sys.modules["jordi_lstm"] = module
-            spec.loader.exec_module(module)  # type: ignore[attr-defined]
-            return module
-    except Exception:
-        pass
-    return None
+def _build_jordi_lstm(input_shape: Tuple[int, int]) -> "object":
+    """Construct the Sequential LSTM architecture from JordiCorbilla's project."""
+
+    from tensorflow.keras import Sequential
+    from tensorflow.keras.layers import Dense, Dropout, LSTM
+
+    model = Sequential()
+    model.add(LSTM(50, return_sequences=True, input_shape=input_shape))
+    model.add(Dropout(0.2))
+    model.add(LSTM(50, return_sequences=True))
+    model.add(Dropout(0.2))
+    model.add(LSTM(50))
+    model.add(Dropout(0.2))
+    model.add(Dense(1))
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    return model
 
 
 async def _rmse_last90(closes: pd.Series) -> float:
@@ -95,50 +91,49 @@ async def predict_future(
         raise ValueError("No historical data")
     closes = df["Close"].astype(float)
 
-    # Normalize
-    values = closes.values.reshape(-1, 1)
-    mu = float(values.mean())
-    sigma = float(values.std() if values.std() != 0 else 1.0)
-    norm = (values - mu) / sigma
+    # Scale to [0, 1] as in JordiCorbilla implementation
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_values = scaler.fit_transform(closes.values.reshape(-1, 1)).reshape(-1)
+    if len(scaled_values) <= 1:
+        raise ValueError("Not enough price history for forecasting")
 
-    window = settings.LSTM_WINDOW
-    X, y = _prepare_sequences(norm.flatten(), min(window, len(norm) - 1))
-    if len(X) == 0:
+    window = min(settings.LSTM_WINDOW, len(scaled_values) - 1)
+    X, y = _prepare_sequences(scaled_values, window)
+
+    # Ensure we have enough samples
+    if X.size == 0:
         raise ValueError("Insufficient data for LSTM window")
 
-    lstm_module = _load_lstm()
-
-    # Fallback EMA forecaster (works without TF)
     def ema_forecast(last_series: np.ndarray, steps: int, alpha: float = 0.2) -> np.ndarray:
-        """Simple EMA forecast on normalized series."""
+        """Simple EMA forecast on scaled series as a safe fallback."""
+
         last = float(last_series[-1])
-        preds = []
+        preds: list[float] = []
         val = last
         for _ in range(steps):
-            val = alpha * val + (1 - alpha) * val  # unchanged (random walk-ish)
+            val = alpha * val + (1 - alpha) * val
             preds.append(val)
-        return np.array(preds)
+        return np.array(preds, dtype=np.float32)
 
-    if lstm_module is None:
-        preds_norm = ema_forecast(norm.flatten(), days)
-    else:
-        try:
-            import tensorflow as tf  # noqa: F401
-            model = lstm_module.build_lstm_model((X.shape[1], 1))  # type: ignore[attr-defined]
-            model.fit(X, y, epochs=5, batch_size=32, verbose=0)  # light training
-            last_seq = norm.flatten()[-X.shape[1] :].reshape(1, X.shape[1], 1)
-            preds = []
-            cur = last_seq.copy()
-            for _ in range(days):
-                pred = float(model.predict(cur, verbose=0)[0])
-                preds.append(pred)
-                cur = np.roll(cur, -1, axis=1)
-                cur[0, -1, 0] = pred
-            preds_norm = np.array(preds)
-        except Exception:
-            preds_norm = ema_forecast(norm.flatten(), days)
+    try:
+        import tensorflow as tf  # noqa: F401
 
-    preds = preds_norm * sigma + mu
+        model = _build_jordi_lstm((X.shape[1], 1))
+        model.fit(X, y, epochs=10, batch_size=32, verbose=0)
+
+        last_seq = scaled_values[-X.shape[1] :].reshape(1, X.shape[1], 1)
+        preds_scaled: list[float] = []
+        cur = last_seq.copy()
+        for _ in range(days):
+            next_pred = float(model.predict(cur, verbose=0)[0][0])
+            preds_scaled.append(next_pred)
+            cur = np.roll(cur, -1, axis=1)
+            cur[0, -1, 0] = next_pred
+        preds_norm = np.array(preds_scaled, dtype=np.float32)
+    except Exception:
+        preds_norm = ema_forecast(scaled_values, days)
+
+    preds = scaler.inverse_transform(preds_norm.reshape(-1, 1)).reshape(-1)
     # Build date index (calendar days)
     last_day = end_date
     out_dates: list[str] = []
